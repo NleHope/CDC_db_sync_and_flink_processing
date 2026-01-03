@@ -1,0 +1,224 @@
+version: '3.8'
+
+services:
+  # Source PostgreSQL Database
+  postgres-source:
+    image: postgres:15
+    container_name: postgres-source
+    environment:
+      POSTGRES_USER: sourceuser
+      POSTGRES_PASSWORD: sourcepass
+      POSTGRES_DB: sourcedb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init_source.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres-source-data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "max_wal_senders=4"
+    networks:
+      - cdc-network
+
+  # Destination PostgreSQL Database
+  postgres-dest:
+    image: postgres:15
+    container_name: postgres-dest
+    environment:
+      POSTGRES_USER: destuser
+      POSTGRES_PASSWORD: destpass
+      POSTGRES_DB: destdb
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init_dest.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres-dest-data:/var/lib/postgresql/data
+    networks:
+      - cdc-network
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - cdc-network
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - cdc-network
+
+  # Debezium Connect
+  debezium:
+    image: debezium/connect:2.4
+    container_name: debezium
+    depends_on:
+      - kafka
+      - postgres-source
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    networks:
+      - cdc-network
+
+  # Flink JobManager
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    container_name: flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        parallelism.default: 2
+    volumes:
+      - ./flink-job:/opt/flink/usrlib
+    networks:
+      - cdc-network
+
+  # Flink TaskManager
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    container_name: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+    volumes:
+      - ./flink-job:/opt/flink/usrlib
+    networks:
+      - cdc-network
+
+  # Python consumer for syncing to destination DB
+  postgres-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: postgres-consumer
+    depends_on:
+      - kafka
+      - postgres-dest
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: dbserver1.public.orders
+      POSTGRES_HOST: postgres-dest
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: destuser
+      POSTGRES_PASSWORD: destpass
+      POSTGRES_DB: destdb
+    networks:
+      - cdc-network
+    restart: unless-stopped
+
+  # Flink SQL Client for submitting jobs
+  flink-sql-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.flink
+    container_name: flink-sql-client
+    depends_on:
+      - flink-jobmanager
+      - kafka
+      - postgres-dest
+    environment:
+      FLINK_JOBMANAGER_HOST: flink-jobmanager
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      POSTGRES_HOST: postgres-dest
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: destuser
+      POSTGRES_PASSWORD: destpass
+      POSTGRES_DB: destdb
+      PYTHONUNBUFFERED: "1"
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        rest.port: 8081
+    volumes:
+      - ./flink-job/flink-init.py:/opt/flink-init.py
+    networks:
+      - cdc-network
+    command: python3 -u /opt/flink-init.py
+
+  # Debezium connector setup
+  debezium-setup:
+    image: curlimages/curl:latest
+    container_name: debezium-setup
+    depends_on:
+      - debezium
+      - postgres-source
+    volumes:
+      - ./debezium-setup.sh:/setup-debezium.sh
+    networks:
+      - cdc-network
+    entrypoint: ["/bin/sh", "/setup-debezium.sh"]
+  
+  mock-data-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.dbsender
+    container_name: mock-data-generator
+    depends_on:
+      - postgres-source
+      - debezium
+      - kafka
+    environment:
+      POSTGRES_HOST: postgres-source
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: sourceuser
+      POSTGRES_PASSWORD: sourcepass
+      POSTGRES_DB: sourcedb
+    networks:
+      - cdc-network
+
+volumes:
+  postgres-source-data:
+  postgres-dest-data:
+
+networks:
+  cdc-network:
+    driver: bridge

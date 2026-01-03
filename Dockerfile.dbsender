@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install required packages
+RUN pip install --no-cache-dir psycopg2-binary
+
+# Copy the data generator script
+COPY ./scripts/mock_stream.py .
+
+CMD ["python", "-u", "mock_stream.py"]
