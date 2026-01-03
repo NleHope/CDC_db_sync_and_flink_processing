@@ -4,7 +4,7 @@ A comprehensive Change Data Capture (CDC) pipeline that demonstrates real-time d
 
 ## 📋 Table of Contents
 
-[Video Demo](./imgs/demo.webm)
+![Demo](./imgs_demo.gif)
 
 - [Overview](#overview)
 - [Architecture](#architecture)
